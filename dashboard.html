@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snort IDS — DHCP Defense Dashboard</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+/*
+  Snort DHCP Defense Dashboard — Stylesheet
+  Topology: Monitoring-1 → ESW1 (VLAN10/20/30) ← kalli-1 (attacker, VLAN30)
+
+  Countermeasure buttons per attack type:
+    DHCP Starvation  → Block Attacker | Isolate Device   | Enable Protection
+    Rogue DHCP       → Block Rogue Server | Enable DHCP Snooping | Clear Bindings
+*/
+:root {
+  --bg-void:       #000000;
+  --bg-panel:      #0a0a0a;
+  --bg-card:       #121212;
+  --bg-inset:      #050505;
+  --border:        #3a3a3a;
+  --border-glow:   #6a6a6a;
+  --accent-blue:   #66ccff;
+  --accent-red:    #ff6b6b;
+  --accent-orange: #ffb347;
+  --accent-green:  #7dff9b;
+  --accent-purple: #d0a6ff;
+  --accent-cyan:   #66fff2;
+  --accent-yellow: #ffe066;
+  --text-primary:  #ffffff;
+  --text-secondary:#e0e0e0;
+  --text-dim:      #b0b0b0;
+  --mono:          'Share Tech Mono', monospace;
+  --ui:            'Rajdhani', sans-serif;
+}
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg-void); color:var(--text-primary); font-family:var(--ui); min-height:100vh; overflow-x:hidden; }
+
+/* ── HEADER ── */
+.header { display:flex; justify-content:space-between; align-items:center; padding:18px 30px; background:#000; border-bottom:1px solid var(--border-glow); flex-wrap:wrap; gap:12px; }
+.logo-section { display:flex; align-items:center; gap:15px; }
+.logo-pulse { width:14px; height:14px; border-radius:50%; background:var(--accent-green); box-shadow:0 0 12px var(--accent-green),0 0 25px rgba(128,237,153,0.4); animation:pulse 2s infinite; flex-shrink:0; }
+@keyframes pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.3)} }
+.header h1 { color:var(--accent-blue); font-size:22px; font-weight:700; letter-spacing:3px; text-transform:uppercase; }
+.header-right { display:flex; align-items:center; gap:20px; flex-wrap:wrap; }
+.live-clock { font-family:var(--mono); color:var(--accent-cyan); font-size:14px; }
+.ids-status { text-align:right; font-family:var(--mono); font-size:12px; }
+.ids-status .label  { color:var(--text-secondary); }
+.ids-status .status { color:var(--accent-green); }
+
+/* ── CONTROLS ── */
+.top-controls { display:flex; gap:12px; flex-wrap:wrap; }
+.control-btn { background:transparent; border:1px solid; padding:9px 16px; border-radius:6px; cursor:pointer; font-size:11px; font-weight:bold; letter-spacing:1px; text-transform:uppercase; transition:0.2s; font-family:var(--ui); }
+.control-btn:hover { transform:scale(1.05); }
+.control-btn:disabled { opacity:0.5; cursor:not-allowed; transform:none; }
+.btn-reset  { border-color:var(--accent-yellow); color:var(--accent-yellow); }
+.btn-visual { border-color:var(--accent-blue);   color:var(--accent-blue);   }
+
+/* ── RESET MODAL ── */
+.modal-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); z-index:1000; justify-content:center; align-items:center; }
+.modal-overlay.active { display:flex; }
+.modal-box { background:var(--bg-card); border:1px solid var(--accent-yellow); border-radius:12px; padding:30px; max-width:500px; width:90%; font-family:var(--mono); }
+.modal-title { color:var(--accent-yellow); font-size:14px; letter-spacing:2px; text-transform:uppercase; margin-bottom:16px; }
+.modal-body  { color:var(--text-secondary); font-size:12px; line-height:1.8; margin-bottom:20px; }
+.modal-status { min-height:40px; padding:10px; background:var(--bg-inset); border-radius:6px; font-size:11px; margin-bottom:16px; border:1px solid var(--border); }
+.modal-buttons { display:flex; gap:10px; justify-content:flex-end; }
+
+/* ── PAGES ── */
+.page { display:none; }
+.page.active { display:block; }
+.container { padding:20px; }
+
+/* ── STAT CARDS ── */
+.top-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:14px; margin-bottom:20px; }
+.cyber-card { background:var(--bg-card); border:1px solid var(--border); padding:18px 20px; border-radius:10px; transition:0.2s; }
+.cyber-card:hover { border-color:var(--border-glow); box-shadow:0 0 25px rgba(76,201,240,0.15); }
+.card-title  { color:var(--text-secondary); text-transform:uppercase; font-size:11px; letter-spacing:2px; margin-bottom:8px; font-family:var(--mono); }
+.card-value  { font-size:36px; font-family:var(--mono); font-weight:bold; line-height:1; }
+.card-footer { margin-top:6px; color:var(--text-dim); font-size:11px; }
+.danger  .card-value { color:var(--accent-red); }
+.warning .card-value { color:var(--accent-orange); }
+.info    .card-value { color:var(--accent-blue); }
+.starv   .card-value { color:var(--accent-orange); }
+.rogue   .card-value { color:var(--accent-red); }
+.starv { border-top:2px solid var(--accent-orange); }
+.rogue { border-top:2px solid var(--accent-red); }
+
+/* ── LAYOUT ── */
+.main-layout { display:grid; grid-template-columns:1.8fr 1fr; gap:18px; margin-bottom:20px; }
+.panel { background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+.panel-header { display:flex; justify-content:space-between; align-items:center; padding:13px 18px; background:var(--bg-inset); border-bottom:1px solid var(--border); gap:10px; flex-wrap:wrap; }
+.panel-title { color:var(--accent-blue); text-transform:uppercase; letter-spacing:2px; font-family:var(--mono); font-size:12px; }
+
+/* ── FILTER TABS ── */
+.filter-tabs { display:flex; gap:6px; }
+.filter-tab { background:transparent; border:1px solid var(--border); color:var(--text-dim); padding:4px 10px; border-radius:4px; cursor:pointer; font-size:10px; font-family:var(--mono); text-transform:uppercase; letter-spacing:1px; transition:0.15s; }
+.filter-tab:hover { border-color:var(--border-glow); color:var(--text-secondary); }
+.filter-tab.active { background:var(--border); color:var(--text-primary); }
+.filter-tab.tab-all.active   { border-color:var(--accent-blue);   color:var(--accent-blue); }
+.filter-tab.tab-starv.active { border-color:var(--accent-orange); color:var(--accent-orange); }
+.filter-tab.tab-rogue.active { border-color:var(--accent-red);    color:var(--accent-red); }
+
+.badge-critical { color:var(--accent-red); border:1px solid var(--accent-red); padding:4px 9px; border-radius:5px; font-size:10px; font-family:var(--mono); }
+.panel-body { padding:14px; }
+.alert-feed { max-height:600px; overflow-y:auto; }
+
+/* ── ALERT CARD ── */
+.alert-item { background:var(--bg-inset); border-left:4px solid var(--accent-red); padding:14px; border-radius:8px; margin-bottom:12px; animation:fadeIn 0.3s ease; }
+.alert-item.starv { border-left-color:var(--accent-orange); }
+.alert-item.rogue { border-left-color:var(--accent-red); }
+@keyframes fadeIn { from{opacity:0;transform:translateY(-6px)} to{opacity:1;transform:none} }
+.alert-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; gap:8px; flex-wrap:wrap; }
+.alert-time { font-family:var(--mono); font-size:11px; color:var(--text-dim); }
+.alert-badges { display:flex; gap:6px; align-items:center; }
+.alert-type-badge { padding:3px 8px; border-radius:4px; font-size:10px; font-family:var(--mono); font-weight:bold; letter-spacing:0.5px; text-transform:uppercase; }
+.badge-starv { background:rgba(255,158,0,0.18);  color:var(--accent-orange); border:1px solid var(--accent-orange); }
+.badge-rogue { background:rgba(255,77,109,0.18); color:var(--accent-red);    border:1px solid var(--accent-red); }
+.alert-severity { color:var(--accent-red); border:1px solid var(--accent-red); padding:3px 8px; border-radius:4px; font-size:10px; font-family:var(--mono); }
+.alert-severity.sev-critical { color:var(--accent-red);    border-color:var(--accent-red); }
+.alert-severity.sev-high     { color:var(--accent-orange); border-color:var(--accent-orange); }
+.alert-msg { font-size:14px; font-weight:bold; margin-bottom:12px; }
+.alert-msg.msg-starv { color:#ffb74d; }
+.alert-msg.msg-rogue { color:#ff9aae; }
+.attack-meta { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:12px; }
+.meta-box { background:#151515; border:1px solid var(--border); padding:8px; border-radius:6px; }
+.meta-label { color:var(--text-dim); font-size:10px; text-transform:uppercase; margin-bottom:3px; font-family:var(--mono); }
+.meta-value { color:var(--text-primary); font-family:var(--mono); font-size:11px; word-break:break-all; }
+
+/* ── COUNTERMEASURE BUTTONS ── */
+.button-group { display:flex; flex-wrap:wrap; gap:8px; }
+.cyber-btn { background:transparent; border:1px solid; padding:7px 12px; border-radius:6px; cursor:pointer; font-size:10px; font-weight:bold; letter-spacing:1px; text-transform:uppercase; transition:0.2s; font-family:var(--ui); }
+.cyber-btn:hover    { transform:scale(1.05); }
+.cyber-btn:disabled { opacity:0.5; cursor:not-allowed; transform:none; }
+.btn-red    { border-color:var(--accent-red);    color:var(--accent-red); }
+.btn-purple { border-color:var(--accent-purple); color:var(--accent-purple); }
+.btn-green  { border-color:var(--accent-green);  color:var(--accent-green); }
+.btn-orange { border-color:var(--accent-orange); color:var(--accent-orange); }
+.btn-cyan   { border-color:var(--accent-cyan);   color:var(--accent-cyan); }
+
+/* ── COUNTERMEASURE RESULT (inside alert card) ── */
+.cm-result { margin-top:10px; padding:10px; background:var(--bg-void); border:1px solid var(--border); border-radius:6px; font-family:var(--mono); font-size:11px; display:none; line-height:1.7; }
+.cm-result.show { display:block; animation:fadeIn 0.3s ease; }
+.cm-success { color:var(--accent-green); }
+.cm-error   { color:var(--accent-red); }
+.cm-pending { color:var(--accent-yellow); }
+
+/* ── SIDE PANEL ── */
+.side-panel { display:flex; flex-direction:column; gap:16px; }
+.info-box { background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
+.info-box h3 { color:var(--accent-blue); font-size:11px; margin-bottom:12px; text-transform:uppercase; letter-spacing:2px; font-family:var(--mono); }
+
+/* ── ATTACK BREAKDOWN TABLE ── */
+.breakdown-table { width:100%; border-collapse:collapse; font-size:12px; }
+.breakdown-table th, .breakdown-table td { padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); font-family:var(--mono); }
+.breakdown-table th { color:var(--text-dim); font-size:10px; text-transform:uppercase; letter-spacing:1px; }
+.breakdown-table td { color:var(--text-primary); }
+.breakdown-table tr:last-child td { border-bottom:none; }
+.bar-cell { display:flex; align-items:center; gap:6px; }
+.mini-bar { height:5px; border-radius:3px; min-width:3px; transition:width .4s; }
+.bar-starv { background:var(--accent-orange); }
+.bar-rogue { background:var(--accent-red); }
+
+/* ── SNORT RULES REFERENCE BOX ── */
+.rules-box { background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
+.rules-box h3 { color:var(--accent-blue); font-size:11px; margin-bottom:12px; text-transform:uppercase; letter-spacing:2px; font-family:var(--mono); }
+.rule-line { font-family:var(--mono); font-size:10px; color:var(--text-dim); padding:4px 0; border-bottom:1px solid var(--border); line-height:1.5; }
+.rule-line:last-child { border-bottom:none; }
+.rule-sid  { color:var(--accent-cyan); }
+.rule-type { color:var(--accent-orange); }
+
+/* ── LOG PANEL ── */
+.log-panel { background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+.log-body { max-height:220px; overflow-y:auto; padding:14px; }
+.log-item { display:flex; gap:10px; padding:8px 0; border-bottom:1px solid var(--border); font-family:var(--mono); font-size:11px; align-items:flex-start; }
+.log-time { color:var(--text-dim); min-width:85px; }
+.log-dot { width:7px; height:7px; border-radius:50%; background:var(--accent-green); margin-top:3px; flex-shrink:0; }
+.log-dot.dot-starv { background:var(--accent-orange); }
+.log-dot.dot-rogue { background:var(--accent-red); }
+.log-dot.dot-reset { background:var(--accent-yellow); }
+.log-msg { color:var(--text-secondary); flex:1; }
+
+/* ── VISUAL PAGE ── */
+.back-btn { margin-bottom:20px; }
+.chart-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:18px; margin-bottom:20px; }
+.chart-card { background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:18px; }
+.chart-title { color:var(--text-secondary); font-size:11px; text-transform:uppercase; margin-bottom:14px; letter-spacing:2px; font-family:var(--mono); }
+canvas { max-height:230px; }
+
+/* ── SCROLLBAR ── */
+::-webkit-scrollbar { width:5px; }
+::-webkit-scrollbar-track { background:var(--bg-inset); }
+::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+
+/* ── RESPONSIVE ── */
+@media (max-width:1300px) { .top-grid { grid-template-columns:repeat(3,1fr); } }
+@media (max-width:1100px) { .chart-grid { grid-template-columns:1fr 1fr; } .main-layout { grid-template-columns:1fr; } }
+@media (max-width:768px)  { .top-grid { grid-template-columns:1fr 1fr; } .chart-grid { grid-template-columns:1fr; } .header { flex-direction:column; gap:16px; } }
+</style>
+</head>
+<body>
+
+<!-- ── RESET CONFIRMATION MODAL ── -->
+<div class="modal-overlay" id="reset-modal">
+  <div class="modal-box">
+    <div class="modal-title">⚠ Reset DHCP Server on ESW1</div>
+    <div class="modal-body">
+      This will SSH into ESW1 and execute:<br><br>
+      <code style="color:var(--accent-cyan)">clear ip dhcp binding *</code><br>
+      <code style="color:var(--accent-cyan)">no service dhcp</code><br>
+      <code style="color:var(--accent-cyan)">service dhcp</code><br><br>
+      All DHCP leases are cleared. Legitimate clients (VLAN 10/20/30) will
+      automatically re-request addresses from ESW1.
+      Use this after a starvation attack has been contained or after clearing
+      rogue DHCP poisoned bindings.
+    </div>
+    <div class="modal-status" id="reset-modal-status" style="color:var(--text-dim);">
+      Ready to reset — confirm below.
+    </div>
+    <div class="modal-buttons">
+      <button class="control-btn" style="border-color:var(--border);color:var(--text-dim);"
+              onclick="closeResetModal()">Cancel</button>
+      <button class="control-btn btn-reset" id="confirm-reset-btn"
+              onclick="confirmReset()">Confirm Reset</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── HEADER ── -->
+<div class="header">
+  <div class="logo-section">
+    <div class="logo-pulse"></div>
+    <h1>Snort IDS — DHCP Defense Dashboard</h1>
+  </div>
+  <div class="header-right">
+    <div class="top-controls">
+      <button class="control-btn btn-reset"  onclick="openResetModal()">Reset DHCP Server</button>
+      <button class="control-btn btn-visual" onclick="openVisualPage()">Visual Analytics</button>
+    </div>
+    <div class="live-clock" id="live-clock">--:--:--</div>
+    <div class="ids-status">
+      <div class="label">SNORT IDS ENGINE</div>
+      <div class="status" id="ids-status-text">● ONLINE</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════ -->
+<!-- MAIN PAGE                                                                 -->
+<!-- ══════════════════════════════════════════════════════════════════════════ -->
+<div id="main-page" class="page active">
+<div class="container">
+
+  <!-- Stat cards -->
+  <div class="top-grid">
+    <div class="cyber-card danger">
+      <div class="card-title">Intrusion Alerts</div>
+      <div class="card-value" id="total-alerts">0</div>
+      <div class="card-footer">All detected attacks</div>
+    </div>
+    <div class="cyber-card starv">
+      <div class="card-title">DHCP Starvation</div>
+      <div class="card-value" id="starv-count">0</div>
+      <div class="card-footer">Pool exhaustion attempts</div>
+    </div>
+    <div class="cyber-card rogue">
+      <div class="card-title">Rogue DHCP Server</div>
+      <div class="card-value" id="rogue-count">0</div>
+      <div class="card-footer">Unauthorised DHCP servers</div>
+    </div>
+    <div class="cyber-card warning">
+      <div class="card-title">Threat Sessions</div>
+      <div class="card-value" id="active-attacks">0</div>
+      <div class="card-footer">Live suspicious sources</div>
+    </div>
+    <div class="cyber-card info">
+      <div class="card-title">Security Actions</div>
+      <div class="card-value" id="counter-total">0</div>
+      <div class="card-footer">Countermeasures executed</div>
+    </div>
+  </div>
+
+  <div class="main-layout">
+
+    <!-- Alert feed -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Real-Time Intrusion Monitor</div>
+        <div class="filter-tabs">
+          <button class="filter-tab tab-all active" onclick="setFilter('all',this)">All</button>
+          <button class="filter-tab tab-starv"       onclick="setFilter('starv',this)">Starvation</button>
+          <button class="filter-tab tab-rogue"       onclick="setFilter('rogue',this)">Rogue DHCP</button>
+        </div>
+        <div class="badge-critical">CRITICAL</div>
+      </div>
+      <div class="panel-body alert-feed" id="alerts-container">
+        <div style="color:var(--text-dim);font-family:var(--mono);font-size:12px;padding:20px 0;text-align:center;">
+          Waiting for Snort alerts from alert_fast.txt…
+        </div>
+      </div>
+    </div>
+
+    <!-- Side panel -->
+    <div class="side-panel">
+
+      <!-- Countermeasure status -->
+      <div class="info-box">
+        <h3>Countermeasure Status</h3>
+        <div id="countermeasure-status" style="font-size:12px;color:var(--text-secondary);font-family:var(--mono);">
+          No countermeasures executed yet.
+        </div>
+      </div>
+
+      <!-- Attack breakdown -->
+      <div class="info-box">
+        <h3>Attack Breakdown</h3>
+        <table class="breakdown-table">
+          <thead><tr><th>Type</th><th>Count</th><th>Share</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>DHCP Starvation</td>
+              <td id="bd-starv">0</td>
+              <td><div class="bar-cell"><div class="mini-bar bar-starv" id="bar-starv" style="width:0px"></div></div></td>
+            </tr>
+            <tr>
+              <td>Rogue DHCP</td>
+              <td id="bd-rogue">0</td>
+              <td><div class="bar-cell"><div class="mini-bar bar-rogue" id="bar-rogue" style="width:0px"></div></div></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Snort rules reference -->
+      <div class="rules-box">
+        <h3>Active Snort Rules</h3>
+        <div class="rule-line">
+          <span class="rule-sid">SID 1000001</span> —
+          <span class="rule-type">DHCP Starvation</span><br>
+          DISCOVER flood · track by_src · 15/5s
+        </div>
+        <div class="rule-line">
+          <span class="rule-sid">SID 1000002</span> —
+          <span class="rule-type">Rogue DHCP OFFER</span><br>
+          !ESW1 SVIs · port 67→68 · option 0x02
+        </div>
+        <div class="rule-line">
+          <span class="rule-sid">SID 1000003</span> —
+          <span class="rule-type">Rogue DHCP ACK</span><br>
+          !ESW1 SVIs · port 67→68 · option 0x05
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Security action log -->
+  <div class="log-panel">
+    <div class="panel-header">
+      <div class="panel-title">Security Action Log</div>
+    </div>
+    <div class="log-body" id="counter-log">
+      <div style="color:var(--text-dim);font-family:var(--mono);font-size:11px;padding:8px 0;">
+        No actions yet.
+      </div>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════ -->
+<!-- VISUAL ANALYTICS PAGE                                                     -->
+<!-- ══════════════════════════════════════════════════════════════════════════ -->
+<div id="visual-page" class="page">
+<div class="container">
+  <button class="control-btn btn-visual back-btn" onclick="closeVisualPage()">← Back To Dashboard</button>
+  <div class="chart-grid">
+    <div class="chart-card"><div class="chart-title">Attack Type Frequency</div><canvas id="attackFreqChart"></canvas></div>
+    <div class="chart-card"><div class="chart-title">Live Packet Rate</div><canvas id="packetRateChart"></canvas></div>
+    <div class="chart-card"><div class="chart-title">Targeted Port Distribution</div><canvas id="portChart"></canvas></div>
+  </div>
+  <div class="chart-grid" style="grid-template-columns:1fr 2fr;">
+    <div class="chart-card"><div class="chart-title">Threat Categories</div><canvas id="idsThreatChart"></canvas></div>
+    <div class="chart-card"><div class="chart-title">Alert Volume (Bhutan Time)</div><canvas id="heatmapChart"></canvas></div>
+  </div>
+</div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════ -->
+<!-- JAVASCRIPT                                                                -->
+<!-- ══════════════════════════════════════════════════════════════════════════ -->
+<script>
+/* ── Clock (Bhutan Standard Time UTC+6) ── */
+function updateClock() {
+  document.getElementById('live-clock').textContent =
+    new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Thimphu', hour12: false });
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+/* ── Socket.IO connection ── */
+const socket = io();
+
+/* ── Chart.js defaults ── */
+Chart.defaults.color       = '#d7e9ff';
+Chart.defaults.borderColor = '#16324f';
+Chart.defaults.font.family = "'Share Tech Mono', monospace";
+
+/* ── State ── */
+const attackCounts   = { 'DHCP Starvation': 0, 'Rogue DHCP Server': 0 };
+const attackedPorts  = {};
+const threatCategory = { 'DHCP Attacks': 0, 'Rogue Servers': 0, 'Network Abuse': 0, 'Intrusion Attempts': 0 };
+let currentFilter    = 'all';
+const MAX_FEED       = 80;
+
+/* ── Page navigation ── */
+function openVisualPage()  {
+  document.getElementById('main-page').classList.remove('active');
+  document.getElementById('visual-page').classList.add('active');
+}
+function closeVisualPage() {
+  document.getElementById('visual-page').classList.remove('active');
+  document.getElementById('main-page').classList.add('active');
+}
+
+/* ── Filter tabs ── */
+function setFilter(f, btn) {
+  currentFilter = f;
+  document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('#alerts-container .alert-item').forEach(el => {
+    el.style.display = (f === 'all' || f === el.dataset.attackType) ? '' : 'none';
+  });
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+   RESET MODAL
+   Calls POST /api/reset-dhcp → ESW1 SSH → clear ip dhcp binding * + restart
+   ─────────────────────────────────────────────────────────────────────────── */
+function openResetModal() {
+  document.getElementById('reset-modal-status').textContent = 'Ready to reset — confirm below.';
+  document.getElementById('reset-modal-status').style.color = 'var(--text-dim)';
+  document.getElementById('confirm-reset-btn').disabled     = false;
+  document.getElementById('confirm-reset-btn').textContent  = 'Confirm Reset';
+  document.getElementById('reset-modal').classList.add('active');
+}
+function closeResetModal() {
+  document.getElementById('reset-modal').classList.remove('active');
+}
+function confirmReset() {
+  const btn       = document.getElementById('confirm-reset-btn');
+  const statusDiv = document.getElementById('reset-modal-status');
+  btn.disabled      = true;
+  btn.textContent   = 'Resetting…';
+  statusDiv.style.color = 'var(--accent-yellow)';
+  statusDiv.textContent = 'SSH → ESW1: executing clear ip dhcp binding * …';
+
+  fetch('/api/reset-dhcp', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({}),
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === 'success') {
+        statusDiv.style.color = 'var(--accent-green)';
+        statusDiv.textContent = '✓ DHCP Server reset successfully — IP pool cleared. Clients will re-request addresses from ESW1.';
+        btn.textContent = 'Done';
+        addLogEntry('ESW1 DHCP reset — bindings cleared, service restarted', 'reset');
+      } else {
+        statusDiv.style.color = 'var(--accent-red)';
+        statusDiv.textContent = '✗ Reset failed: ' + (data.message || 'SSH connection error');
+        btn.disabled  = false;
+        btn.textContent = 'Retry';
+      }
+    })
+    .catch(err => {
+      statusDiv.style.color = 'var(--accent-red)';
+      statusDiv.textContent = '✗ Network error: ' + err.message;
+      btn.disabled  = false;
+      btn.textContent = 'Retry';
+    });
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+   EXECUTE COUNTERMEASURE
+   Called from alert card buttons. POSTs to /api/countermeasures/execute.
+
+   DHCP Starvation buttons  → 'Block Attacker' | 'Isolate Device' | 'Enable Protection'
+   Rogue DHCP buttons       → 'Block Rogue Server' | 'Enable DHCP Snooping' | 'Clear Bindings'
+   ─────────────────────────────────────────────────────────────────────────── */
+function executeMeasure(type, alert, resultDivId) {
+  const resultDiv = document.getElementById(resultDivId);
+  const btn       = event.target;
+
+  btn.disabled = true;
+
+  if (resultDiv) {
+    resultDiv.className  = 'cm-result show';
+    resultDiv.innerHTML  = `<span class="cm-pending">⟳ Executing: ${type} — connecting to ESW1 via SSH…</span>`;
+  }
+
+  document.getElementById('countermeasure-status').innerHTML = `
+    <div style="color:var(--accent-yellow);font-weight:bold;margin-bottom:6px;">⟳ Executing Countermeasure…</div>
+    <div style="color:var(--text-secondary);font-size:11px;">Action : ${type}</div>
+    <div style="color:var(--text-secondary);font-size:11px;">Target : ${alert.src_ip}</div>
+    <div style="color:var(--text-secondary);font-size:11px;">Subnet : ${alert.target_subnet}</div>`;
+
+  fetch('/api/countermeasures/execute', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ alert: alert, type: type }),
+  })
+    .then(r => r.json())
+    .then(data => {
+      const success = data.success_count > 0;
+      const measures = data.measures || [];
+      const detail   = measures.length
+        ? measures.map(m => `${m.type}: ${m.status} — ${m.action || m.detail}`).join('<br>')
+        : (success ? 'Command executed on ESW1' : 'ESW1 command failed');
+
+      if (resultDiv) {
+        resultDiv.className = 'cm-result show';
+        resultDiv.innerHTML = success
+          ? `<span class="cm-success">✓ ${type} applied via SSH to ESW1</span><br>
+             <span style="color:var(--text-dim);font-size:10px;line-height:1.7">${detail}</span>`
+          : `<span class="cm-error">✗ Failed: ${detail}</span>`;
+      }
+
+      document.getElementById('countermeasure-status').innerHTML = success
+        ? `<div style="color:var(--accent-green);font-weight:bold;margin-bottom:6px;">✓ Countermeasure Applied</div>
+           <div style="color:var(--text-secondary);font-size:11px;">Action : ${type}</div>
+           <div style="color:var(--text-secondary);font-size:11px;">Target : ${alert.src_ip}</div>
+           <div style="color:var(--accent-green);font-size:11px;margin-top:4px;">ESW1 SSH command executed successfully</div>`
+        : `<div style="color:var(--accent-red);font-weight:bold;">✗ Countermeasure Failed</div>
+           <div style="color:var(--text-dim);font-size:11px;">Check SSH connectivity to ESW1 (${alert.target_subnet})</div>`;
+
+      const total = parseInt(document.getElementById('counter-total').textContent || '0') + 1;
+      document.getElementById('counter-total').textContent = total;
+
+      const isRogue = alert.attack_type === 'rogue_dhcp';
+      addLogEntry(
+        `${type} → ${alert.src_ip} [${isRogue ? 'Rogue DHCP' : 'Starvation'}] — ${success ? 'SUCCESS' : 'FAILED'}`,
+        isRogue ? 'rogue' : 'starv'
+      );
+    })
+    .catch(err => {
+      if (resultDiv) {
+        resultDiv.className = 'cm-result show';
+        resultDiv.innerHTML = `<span class="cm-error">✗ Fetch error: ${err.message}</span>`;
+      }
+      btn.disabled = false;
+    });
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+   RENDER ALERT CARD
+
+   Starvation buttons:
+     [Block Attacker]     → isolate_attacker_port  (shutdown flood source)
+     [Isolate Device]     → rate_limit_dhcp_port   (rate-limit, softer option)
+     [Enable Protection]  → enable_dhcp_snooping   (snooping all VLANs)
+
+   Rogue DHCP buttons:
+     [Block Rogue Server]    → block_rogue_dhcp_port  (shutdown + snooping)
+     [Enable DHCP Snooping]  → enable_dhcp_snooping   (protect remaining VLANs)
+     [Clear Bindings]        → clear_poisoned_bindings (flush poisoned leases)
+   ─────────────────────────────────────────────────────────────────────────── */
+function renderAlert(alert) {
+  const isRogue   = alert.attack_type === 'rogue_dhcp';
+  const typeClass = isRogue ? 'rogue' : 'starv';
+  const typeLabel = isRogue ? 'ROGUE DHCP SERVER' : 'DHCP STARVATION';
+  const badgeCls  = isRogue ? 'badge-rogue' : 'badge-starv';
+  const msgCls    = isRogue ? 'msg-rogue'   : 'msg-starv';
+  const sevLabel  = isRogue ? 'CRITICAL'    : 'HIGH';
+  const sevCls    = isRogue ? 'sev-critical': 'sev-high';
+  const resultId  = `cm-result-${Date.now()}-${Math.random().toString(36).substr(2,5)}`;
+
+  const displayMsg = isRogue
+    ? (alert.msg || 'Rogue DHCP Server Detected — Unauthorised DHCP Response')
+    : (alert.msg || 'DHCP Starvation Attack — Pool Exhaustion Attempt');
+
+  const alertJSON = JSON.stringify(alert).replace(/'/g, "\\'");
+
+  /*
+    Button mapping:
+      Starvation → Block Attacker | Isolate Device | Enable Protection
+      Rogue DHCP → Block Rogue Server | Enable DHCP Snooping | Clear Bindings
+  */
+  const buttons = isRogue
+    ? `
+      <button class="cyber-btn btn-red"
+        onclick='executeMeasure("Block Rogue Server", ${alertJSON}, "${resultId}")'>
+        Block Rogue Server
+      </button>
+      <button class="cyber-btn btn-orange"
+        onclick='executeMeasure("Enable DHCP Snooping", ${alertJSON}, "${resultId}")'>
+        Enable DHCP Snooping
+      </button>
+      <button class="cyber-btn btn-cyan"
+        onclick='executeMeasure("Clear Bindings", ${alertJSON}, "${resultId}")'>
+        Clear Bindings
+      </button>`
+    : `
+      <button class="cyber-btn btn-red"
+        onclick='executeMeasure("Block Attacker", ${alertJSON}, "${resultId}")'>
+        Block Attacker
+      </button>
+      <button class="cyber-btn btn-purple"
+        onclick='executeMeasure("Isolate Device", ${alertJSON}, "${resultId}")'>
+        Isolate Device
+      </button>
+      <button class="cyber-btn btn-green"
+        onclick='executeMeasure("Enable Protection", ${alertJSON}, "${resultId}")'>
+        Enable Protection
+      </button>`;
+
+  const bhutanTime = new Date().toLocaleString('en-GB', { timeZone: 'Asia/Thimphu' });
+  const sidLabel   = isRogue
+    ? `SID ${alert.sid} (OFFER/ACK)`
+    : `SID ${alert.sid} (DISCOVER)`;
+
+  const div = document.createElement('div');
+  div.className          = `alert-item ${typeClass}`;
+  div.dataset.attackType = typeClass;
+
+  div.innerHTML = `
+    <div class="alert-header">
+      <div class="alert-time">${bhutanTime}</div>
+      <div class="alert-badges">
+        <span class="alert-type-badge ${badgeCls}">${typeLabel}</span>
+        <span class="alert-severity ${sevCls}">${sevLabel}</span>
+      </div>
+    </div>
+    <div class="alert-msg ${msgCls}">${displayMsg}</div>
+    <div class="attack-meta">
+      <div class="meta-box">
+        <div class="meta-label">${isRogue ? 'Rogue Server IP' : 'Attacker IP'}</div>
+        <div class="meta-value">${alert.src_ip || 'unknown'}</div>
+      </div>
+      <div class="meta-box">
+        <div class="meta-label">Snort SID</div>
+        <div class="meta-value">${sidLabel}</div>
+      </div>
+      <div class="meta-box">
+        <div class="meta-label">${isRogue ? 'Client Port' : 'Target Port'}</div>
+        <div class="meta-value">${alert.dst_port || (isRogue ? '68' : '67')}</div>
+      </div>
+      <div class="meta-box">
+        <div class="meta-label">Priority</div>
+        <div class="meta-value">${alert.priority || (isRogue ? '1' : '2')}</div>
+      </div>
+      <div class="meta-box">
+        <div class="meta-label">MAC Address</div>
+        <div class="meta-value">${alert.src_mac || 'unknown'}</div>
+      </div>
+      <div class="meta-box">
+        <div class="meta-label">Subnet</div>
+        <div class="meta-value">${alert.target_subnet || 'unknown'}</div>
+      </div>
+    </div>
+    <div class="button-group">${buttons}</div>
+    <div class="cm-result" id="${resultId}"></div>`;
+
+  if (currentFilter !== 'all' && currentFilter !== typeClass) {
+    div.style.display = 'none';
+  }
+
+  return div;
+}
+
+/* ── Charts ── */
+let attackFreqChart, packetRateChart, portChart, idsThreatChart, heatmapChart;
+
+function initCharts() {
+  attackFreqChart = new Chart(document.getElementById('attackFreqChart'), {
+    type: 'bar',
+    data: {
+      labels: ['DHCP Starvation', 'Rogue DHCP Server'],
+      datasets: [{
+        label: 'Detected Attacks',
+        data: [0, 0],
+        backgroundColor: ['#ff9e00', '#ff4d6d'],
+        borderRadius: 6,
+      }],
+    },
+    options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } },
+  });
+
+  const tl = []; const td = [];
+  for (let i = 10; i >= 0; i--) { tl.push(i); td.push(0); }
+  packetRateChart = new Chart(document.getElementById('packetRateChart'), {
+    type: 'line',
+    data: {
+      labels: tl,
+      datasets: [{
+        data: td,
+        borderColor: '#00f5d4',
+        backgroundColor: 'rgba(0,245,212,0.15)',
+        fill: true, tension: 0.4, borderWidth: 3, pointRadius: 0,
+      }],
+    },
+    options: { plugins: { legend: { display: false } } },
+  });
+
+  portChart = new Chart(document.getElementById('portChart'), {
+    type: 'doughnut',
+    data: {
+      labels: [],
+      datasets: [{ data: [], backgroundColor: ['#ff4d6d', '#ff9e00', '#4cc9f0', '#80ed99', '#c77dff'] }],
+    },
+  });
+
+  idsThreatChart = new Chart(document.getElementById('idsThreatChart'), {
+    type: 'radar',
+    data: {
+      labels: ['DHCP Attacks', 'Rogue Servers', 'Network Abuse', 'Intrusion Attempts'],
+      datasets: [{
+        label: 'Threat Level',
+        data: [0, 0, 0, 0],
+        borderColor: '#ff4d6d',
+        backgroundColor: 'rgba(255,77,109,0.2)',
+        pointBackgroundColor: '#ff4d6d',
+        borderWidth: 2,
+      }],
+    },
+  });
+
+  heatmapChart = new Chart(document.getElementById('heatmapChart'), {
+    type: 'bar',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'Starvation', data: [], backgroundColor: '#ff9e00', borderRadius: 4 },
+        { label: 'Rogue DHCP', data: [], backgroundColor: '#ff4d6d', borderRadius: 4 },
+      ],
+    },
+    options: { scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } } },
+  });
+}
+
+/* ── Update stat cards ── */
+function updateStats(stats) {
+  document.getElementById('total-alerts').textContent   = stats.total_alerts     || 0;
+  document.getElementById('starv-count').textContent    = stats.total_starvation  || 0;
+  document.getElementById('rogue-count').textContent    = stats.total_rogue_dhcp  || 0;
+  document.getElementById('active-attacks').textContent = stats.active_attacks    || 0;
+
+  const sv  = stats.total_starvation  || 0;
+  const rv  = stats.total_rogue_dhcp  || 0;
+  const tot = sv + rv || 1;
+  document.getElementById('bd-starv').textContent = sv;
+  document.getElementById('bd-rogue').textContent = rv;
+  document.getElementById('bar-starv').style.width = Math.round(sv / tot * 100) + 'px';
+  document.getElementById('bar-rogue').style.width  = Math.round(rv / tot * 100) + 'px';
+}
+
+/* ── Update charts on new alert ── */
+function updateCharts(alert) {
+  const isRogue = alert.attack_type === 'rogue_dhcp';
+
+  if (isRogue) attackCounts['Rogue DHCP Server']++;
+  else         attackCounts['DHCP Starvation']++;
+  attackFreqChart.data.datasets[0].data = Object.values(attackCounts);
+  attackFreqChart.update();
+
+  if (isRogue) {
+    threatCategory['DHCP Attacks']       += 1;
+    threatCategory['Rogue Servers']       += 3;
+    threatCategory['Network Abuse']       += 2;
+    threatCategory['Intrusion Attempts']  += 2;
+  } else {
+    threatCategory['DHCP Attacks']        += 3;
+    threatCategory['Rogue Servers']       += 0;
+    threatCategory['Network Abuse']       += 1;
+    threatCategory['Intrusion Attempts']  += 2;
+  }
+  idsThreatChart.data.datasets[0].data = Object.values(threatCategory);
+  idsThreatChart.update();
+
+  const port = (alert.dst_port || (isRogue ? '68' : '67')).toString();
+  attackedPorts[port] = (attackedPorts[port] || 0) + 1;
+  portChart.data.labels           = Object.keys(attackedPorts);
+  portChart.data.datasets[0].data = Object.values(attackedPorts);
+  portChart.update();
+
+  const t   = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Thimphu', hour12: false });
+  const idx = heatmapChart.data.labels.indexOf(t);
+  if (idx === -1) {
+    heatmapChart.data.labels.push(t);
+    heatmapChart.data.datasets[0].data.push(isRogue ? 0 : 1);
+    heatmapChart.data.datasets[1].data.push(isRogue ? 1 : 0);
+    if (heatmapChart.data.labels.length > 15) {
+      heatmapChart.data.labels.shift();
+      heatmapChart.data.datasets.forEach(d => d.data.shift());
+    }
+  } else {
+    heatmapChart.data.datasets[isRogue ? 1 : 0].data[idx]++;
+  }
+  heatmapChart.update();
+
+  packetRateChart.data.datasets[0].data.push(Math.floor(Math.random() * 500 + 100));
+  packetRateChart.data.datasets[0].data.shift();
+  packetRateChart.update();
+}
+
+/* ── Add entry to security action log ── */
+function addLogEntry(msg, type) {
+  const container = document.getElementById('counter-log');
+  const placeholder = container.querySelector('div:not(.log-item)');
+  if (placeholder) placeholder.remove();
+
+  const t       = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Thimphu' });
+  const dotClass = type === 'rogue' ? 'dot-rogue' : type === 'starv' ? 'dot-starv' : type === 'reset' ? 'dot-reset' : '';
+  const div = document.createElement('div');
+  div.className = 'log-item';
+  div.innerHTML = `
+    <span class="log-time">${t}</span>
+    <div class="log-dot ${dotClass}"></div>
+    <span class="log-msg">${msg}</span>`;
+  container.prepend(div);
+  while (container.children.length > 60) container.lastElementChild.remove();
+}
+
+/* ── Socket.IO event handlers ── */
+socket.on('initial_data', function(data) {
+  updateStats(data.stats);
+  const container = document.getElementById('alerts-container');
+  container.innerHTML = '';
+  if (data.alerts && data.alerts.length) {
+    data.alerts.forEach(alert => {
+      container.appendChild(renderAlert(alert));
+      updateCharts(alert);
+    });
+  }
+});
+
+socket.on('new_alert', function(data) {
+  updateStats(data.stats);
+  const container   = document.getElementById('alerts-container');
+  const placeholder = container.querySelector('div:not(.alert-item)');
+  if (placeholder) placeholder.remove();
+  container.prepend(renderAlert(data.alert));
+  updateCharts(data.alert);
+  while (container.children.length > MAX_FEED) container.lastElementChild.remove();
+});
+
+socket.on('dhcp_reset_result', function(data) {
+  addLogEntry('DHCP Server reset on ESW1 — ' + (data.status === 'success' ? 'SUCCESS' : 'FAILED'), 'reset');
+});
+
+socket.on('countermeasure_result', function(data) {
+  if (data.result) {
+    const r = data.result;
+    addLogEntry(
+      `Countermeasure on ${r.src_ip} — ${r.success_count} action(s) applied`,
+      r.attack_type === 'rogue_dhcp' ? 'rogue' : 'starv'
+    );
+  }
+});
+
+socket.on('countermeasure_executed', function(data) {
+  if (data.stats) updateStats(data.stats);
+});
+
+/* ── Boot ── */
+initCharts();
+</script>
+</body>
+</html>
