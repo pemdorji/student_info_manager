@@ -1,90 +1,779 @@
-<!DOCTYPE html> 
-<html lang="en"> 
-<head> 
-  <meta charset="UTF-8" /> 
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" /> 
-  <title>Student Info Manager</title> 
-  <style> 
-    body { 
-      font-family: Arial, sans-serif; 
-      margin: 30px; 
-    } 
-    h1, h2 { 
-      color: #333; 
-    } 
-    table { 
-      width: 100%; 
-      border-collapse: collapse; 
-      margin-bottom: 25px; 
-    } 
-    th, td { 
-      border: 1px solid #ccc; 
-      padding: 10px; 
-      text-align: left; 
-    } 
-    th { 
-      background-color: #f4f4f4; 
-    } 
-    tr:nth-child(even) { 
-      background-color: #fafafa; 
-    } 
-  </style> 
-</head> 
-<body> 
-  <h1>Student Information Manager</h1>
-   <h2>Student List</h2> 
-  <table> 
-    <tr> 
-      <th>Student ID</th> 
-      <th>Name</th> 
-      <th>Course</th> 
-      <th>Phone Number</th> 
-    </tr> 
-    <tr> 
-      <td>524001</td> 
-      <td>Karma Wangchuk</td> 
-      <td>BEPE</td> 
-      <td>17123456</td> 
-    </tr> 
-    <tr> 
-      <td>524002</td> 
-      <td>Sonam Choden</td> 
-      <td>BESG</td> 
-      <td>17234567</td> 
-    </tr> 
-    <tr> 
-      <td>524003</td> 
-      <td>Pema Dorji</td> 
-      <td>DECE</td> 
-      <td>17345678</td> 
-    </tr> 
-    <tr> 
-      <td>524004</td> 
-      <td>Dechen Yangzom</td> 
-      <td>DCSN</td> 
-      <td>17456789</td> 
-    </tr> 
-    border="1" cellpadding="8">
-    <tr>
-      <th>Course Name</th>
-      <th>Department</th>
-      <th>Department Head</th>
-    </tr>
-    <tr>
-      <td>BEPE</td>
-      <td>Electrical Engineering Department</td>
-      <td>Mr. Tandin Dorji</td>
-    </tr>
-    <tr>
-      <td>BESG</td>
-      <td>Sustainable and Geo Engineering Department</td>
-      <td>Ms. Chimi Dema</td>
-    </tr>
-    <tr>
-      <td>DECE</td>
-      <td>Civil Engineering Department</td>
-      <td>Mr. Ugyen Tshering</td>
-    </tr>
-  </table> 
-</body> 
-</html> 
+#!/usr/bin/env python3
+"""
+Snort DHCP Defense Dashboard
+Detects: DHCP Starvation + Rogue DHCP Server attacks
+Real-time monitoring with SSH-based active countermeasures on ESW1
+
+Topology:
+  ESW1 (IOS EtherSwitch) — DHCP server for 3 VLANs
+    VLAN 10 → 192.168.10.0/24  (DIT)        SVI: 192.168.10.1
+    VLAN 20 → 192.168.20.0/24  (Mechanical) SVI: 192.168.20.1
+    VLAN 30 → 192.168.30.0/24  (Civil)      SVI: 192.168.30.1  ← attacker (kalli-1)
+  Monitoring-1 — Snort 3 + this dashboard (connected to ESW1 via SPAN)
+
+Snort Rules (local.rules):
+  SID 1000001 — DHCP Starvation  (DISCOVER flood, track by_src)
+  SID 1000002 — Rogue DHCP OFFER (!ESW1 SVIs sending OFFER)
+  SID 1000003 — Rogue DHCP ACK   (!ESW1 SVIs sending ACK)
+"""
+
+import os
+import json
+import time
+import threading
+import subprocess
+import ipaddress
+from datetime import datetime
+from collections import defaultdict, deque
+
+import paramiko
+from flask import Flask, render_template, jsonify, request
+from flask_socketio import SocketIO, emit
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'snort-dashboard-secret-key-2026'
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# ─── Configuration ─────────────────────────────────────────────────────────────
+CONFIG = {
+    'SNORT_LOG_DIR':       '/var/log/snort',
+    'ALERT_FAST_FILE':     'alert_fast.txt',
+    'MAX_ALERTS_DISPLAY':  100,
+    'HOME_NETS':           ['192.168.10.0/24', '192.168.20.0/24', '192.168.30.0/24'],
+
+    # ── Snort SIDs — must match local.rules ───────────────────────────────────
+    # SID 1000001 → DHCP Starvation (DISCOVER flood)
+    # SID 1000002 → Rogue DHCP OFFER from non-ESW1 host
+    # SID 1000003 → Rogue DHCP ACK   from non-ESW1 host
+    'SID_DHCP_STARVATION': 1000001,
+    'SID_ROGUE_DHCP':      [1000002, 1000003],   # both OFFER and ACK are rogue
+
+    # ── Alert keyword fallback (when SID not present in log line) ─────────────
+    'KEYWORDS_STARVATION': ['DHCP Starvation', 'Possible DHCP Starvation'],
+    'KEYWORDS_ROGUE_DHCP': [
+        'Rogue DHCP', 'Unauthorized DHCP Server',
+        'Unexpected DHCP Offer', 'DHCP Offer from unknown',
+        'Rogue DHCP Offer', 'Rogue DHCP ACK',
+    ],
+
+    # ── ESW1 SSH — management VLAN 99 SVI reachable from Monitoring-1 ─────────
+    'ESW1_HOST':     '192.168.1.1',
+    'ESW1_PORT':     22,
+    'ESW1_USER':     'admin',
+    'ESW1_PASSWORD': 'admin123',
+    'ESW1_TIMEOUT':  10,
+
+    # ── Map each subnet to the ESW1 downlink port serving that department ──────
+    # Update these port numbers to match your actual GNS3 cabling
+    'SUBNET_PORT_MAP': {
+        '192.168.10.0/24': 'f1/3',   # DIT department
+        '192.168.20.0/24': 'f1/2',   # Mechanical department
+        '192.168.30.0/24': 'f1/1',   # Civil / kalli-1 attacker
+    },
+    'ATTACKER_PORT': 'f1/1',          # default fallback port
+
+    # ── Trusted DHCP server IPs (ESW1 SVIs only) ──────────────────────────────
+    # Used for display/logging — actual enforcement is in Snort rules
+    'TRUSTED_DHCP_SERVERS': ['192.168.10.1', '192.168.20.1', '192.168.30.1'],
+}
+
+# ─── Global State ──────────────────────────────────────────────────────────────
+alert_history   = deque(maxlen=CONFIG['MAX_ALERTS_DISPLAY'])
+attack_stats    = {
+    'total_alerts':              0,
+    'total_starvation':          0,
+    'total_rogue_dhcp':          0,
+    'active_attacks':            0,
+    'blocked_hosts':             set(),
+    'countermeasures_triggered': 0,
+    'attacks_by_subnet':         defaultdict(int),
+    'attacks_by_src_ip':         defaultdict(int),
+    'attack_timeline':           deque(maxlen=60),
+}
+countermeasure_log     = deque(maxlen=50)
+lock                   = threading.Lock()
+active_countermeasures = {}
+
+
+# ─── SSH Helper ────────────────────────────────────────────────────────────────
+class ESW1SSH:
+    """
+    Manages SSH sessions to ESW1 for executing IOS countermeasure commands.
+    Monitoring-1 reaches ESW1 via the management VLAN 99 SVI (192.168.1.1).
+    """
+
+    def __init__(self):
+        self.host     = CONFIG['ESW1_HOST']
+        self.port     = CONFIG['ESW1_PORT']
+        self.username = CONFIG['ESW1_USER']
+        self.password = CONFIG['ESW1_PASSWORD']
+        self.timeout  = CONFIG['ESW1_TIMEOUT']
+
+    def _connect(self):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            self.host,
+            port=self.port,
+            username=self.username,
+            password=self.password,
+            timeout=self.timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        return client
+
+    def run_commands(self, commands: list) -> dict:
+        output_lines = []
+        try:
+            client  = self._connect()
+            channel = client.invoke_shell()
+            time.sleep(1)
+
+            channel.send('terminal length 0\n')
+            time.sleep(0.5)
+            channel.recv(4096)
+
+            for cmd in commands:
+                channel.send(cmd + '\n')
+                time.sleep(0.8)
+                if channel.recv_ready():
+                    chunk = channel.recv(4096).decode('utf-8', errors='ignore')
+                    output_lines.append(chunk)
+
+            time.sleep(0.5)
+            while channel.recv_ready():
+                output_lines.append(channel.recv(4096).decode('utf-8', errors='ignore'))
+
+            channel.close()
+            client.close()
+
+            return {
+                'status':   'success',
+                'output':   '\n'.join(output_lines),
+                'commands': commands,
+            }
+
+        except paramiko.AuthenticationException:
+            return {'status': 'error', 'output': 'SSH authentication failed — check ESW1 credentials', 'commands': commands}
+        except paramiko.SSHException as e:
+            return {'status': 'error', 'output': f'SSH error: {str(e)}', 'commands': commands}
+        except Exception as e:
+            return {'status': 'error', 'output': f'Connection failed: {str(e)}', 'commands': commands}
+
+    # ── Countermeasure methods ─────────────────────────────────────────────────
+
+    def reset_dhcp_server(self) -> dict:
+        """
+        Clears all DHCP bindings and restarts the DHCP service on ESW1.
+        Use after starvation attack exhausts the pool OR after rogue server
+        has poisoned bindings.
+        """
+        commands = [
+            'clear ip dhcp binding *',
+            'configure terminal',
+            'no service dhcp',
+            'service dhcp',
+            'end',
+            'show ip dhcp binding',
+        ]
+        result = self.run_commands(commands)
+        result['action'] = 'DHCP Server Reset — bindings cleared, service restarted'
+        return result
+
+    def isolate_attacker_port(self, subnet: str) -> dict:
+        """
+        Shuts down the ESW1 downlink port for the given subnet.
+        Used for DHCP starvation — cuts off the flooding source.
+        """
+        port = CONFIG['SUBNET_PORT_MAP'].get(subnet, CONFIG['ATTACKER_PORT'])
+        commands = [
+            'configure terminal',
+            f'interface {port}',
+            'shutdown',
+            'end',
+            f'show interface {port} status',
+        ]
+        result = self.run_commands(commands)
+        result['action'] = f'Port isolation — {port} shutdown (starvation attacker)'
+        result['port']   = port
+        return result
+
+    def enable_dhcp_snooping(self, vlan_ids: str = '10,20,30') -> dict:
+        """
+        Enables DHCP Snooping on ESW1 for all campus VLANs.
+        Marks the router/uplink port as trusted; all other ports become
+        untrusted — blocks any rogue DHCP server responses network-wide.
+        """
+        commands = [
+            'configure terminal',
+            'ip dhcp snooping',
+            f'ip dhcp snooping vlan {vlan_ids}',
+            'no ip dhcp snooping information option',
+            'interface f1/0',            # uplink to router — adjust if different
+            'ip dhcp snooping trust',
+            'exit',
+            'end',
+            'show ip dhcp snooping',
+        ]
+        result = self.run_commands(commands)
+        result['action'] = f'DHCP Snooping enabled on VLANs {vlan_ids} — all downlinks set untrusted'
+        return result
+
+    def rate_limit_dhcp_port(self, subnet: str, rate: int = 10) -> dict:
+        """
+        Applies DHCP snooping rate limiting on the attacker's port.
+        Slows starvation floods without fully isolating the port.
+        """
+        port = CONFIG['SUBNET_PORT_MAP'].get(subnet, CONFIG['ATTACKER_PORT'])
+        commands = [
+            'configure terminal',
+            f'interface {port}',
+            f'ip dhcp snooping limit rate {rate}',
+            'exit',
+            'end',
+            f'show ip dhcp snooping interface {port}',
+        ]
+        result = self.run_commands(commands)
+        result['action'] = f'DHCP rate limit {rate} pps applied on {port}'
+        result['port']   = port
+        return result
+
+    def block_rogue_dhcp_port(self, subnet: str) -> dict:
+        """
+        ROGUE DHCP countermeasure — Step 1:
+        Shuts down the port the rogue server is on AND enables DHCP Snooping
+        to prevent any other rogue servers from responding on remaining ports.
+        """
+        port = CONFIG['SUBNET_PORT_MAP'].get(subnet, CONFIG['ATTACKER_PORT'])
+        commands = [
+            'configure terminal',
+            f'interface {port}',
+            'shutdown',
+            'exit',
+            'ip dhcp snooping',
+            'ip dhcp snooping vlan 10,20,30',
+            'no ip dhcp snooping information option',
+            'interface f1/0',
+            'ip dhcp snooping trust',
+            'exit',
+            'end',
+            'show ip dhcp snooping',
+        ]
+        result = self.run_commands(commands)
+        result['action'] = f'Rogue DHCP blocked — port {port} shutdown + snooping enabled on all VLANs'
+        result['port']   = port
+        return result
+
+    def clear_poisoned_bindings(self) -> dict:
+        """
+        ROGUE DHCP countermeasure — Step 3:
+        After blocking the rogue server, clear all DHCP bindings so clients
+        that received a rogue IP will re-request from the legitimate ESW1 server.
+        This is the most important recovery step for rogue DHCP attacks.
+        """
+        commands = [
+            'clear ip dhcp binding *',
+            'configure terminal',
+            'no service dhcp',
+            'service dhcp',
+            'end',
+            'show ip dhcp binding',
+            'show ip dhcp pool',
+        ]
+        result = self.run_commands(commands)
+        result['action'] = 'Poisoned DHCP bindings cleared — clients will re-request from ESW1'
+        return result
+
+    def restore_port(self, subnet: str) -> dict:
+        """Re-enables a previously shutdown port after the threat is resolved."""
+        port = CONFIG['SUBNET_PORT_MAP'].get(subnet, CONFIG['ATTACKER_PORT'])
+        commands = [
+            'configure terminal',
+            f'interface {port}',
+            'no shutdown',
+            'end',
+            f'show interface {port} status',
+        ]
+        result = self.run_commands(commands)
+        result['action'] = f'Port {port} restored (no shutdown)'
+        result['port']   = port
+        return result
+
+
+esw1 = ESW1SSH()
+
+
+# ─── Countermeasure Engine ─────────────────────────────────────────────────────
+class CountermeasureEngine:
+    """
+    Routes countermeasure button clicks to the correct ESW1 SSH actions.
+
+    DHCP Starvation buttons:
+      'Block Attacker'    → isolate_attacker_port  (shutdown flood source port)
+      'Isolate Device'    → rate_limit_dhcp_port   (rate-limit before full block)
+      'Enable Protection' → enable_dhcp_snooping   (enable snooping all VLANs)
+
+    Rogue DHCP buttons:
+      'Block Rogue Server'   → block_rogue_dhcp_port  (shutdown port + snooping)
+      'Enable DHCP Snooping' → enable_dhcp_snooping   (protect remaining VLANs)
+      'Clear Bindings'       → clear_poisoned_bindings (recover poisoned clients)
+    """
+
+    def execute_countermeasure(self, alert_data: dict, measure_type: str = 'all') -> dict:
+        src_ip      = alert_data.get('src_ip',        'unknown')
+        subnet      = alert_data.get('target_subnet', 'unknown')
+        attack_type = alert_data.get('attack_type',   'dhcp_starvation')
+        timestamp   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        results = []
+
+        # ── DHCP Starvation ────────────────────────────────────────────────────
+        if attack_type == 'dhcp_starvation':
+
+            if measure_type in ('all', 'Block Attacker'):
+                r = esw1.isolate_attacker_port(subnet)
+                results.append(self._fmt('Isolate Attacker Port', src_ip, r))
+
+            if measure_type in ('all', 'Isolate Device'):
+                r = esw1.rate_limit_dhcp_port(subnet)
+                results.append(self._fmt('DHCP Rate Limiting', src_ip, r))
+
+            if measure_type in ('all', 'Enable Protection'):
+                r = esw1.enable_dhcp_snooping()
+                results.append(self._fmt('DHCP Snooping', subnet, r))
+
+        # ── Rogue DHCP Server ──────────────────────────────────────────────────
+        elif attack_type == 'rogue_dhcp':
+
+            if measure_type in ('all', 'Block Rogue Server'):
+                # Step 1: shutdown rogue port + enable snooping
+                r = esw1.block_rogue_dhcp_port(subnet)
+                results.append(self._fmt('Block Rogue DHCP Port', src_ip, r))
+
+            if measure_type in ('all', 'Enable DHCP Snooping'):
+                # Step 2: ensure snooping covers all remaining VLANs
+                r = esw1.enable_dhcp_snooping()
+                results.append(self._fmt('DHCP Snooping All VLANs', subnet, r))
+
+            if measure_type in ('all', 'Clear Bindings'):
+                # Step 3: flush poisoned bindings so clients recover
+                r = esw1.clear_poisoned_bindings()
+                results.append(self._fmt('Clear Poisoned Bindings', src_ip, r))
+
+        log_entry = {
+            'timestamp':     timestamp,
+            'alert_id':      alert_data.get('sid', 'unknown'),
+            'attack_type':   attack_type,
+            'src_ip':        src_ip,
+            'subnet':        subnet,
+            'measures':      results,
+            'success_count': sum(1 for r in results if r['status'] == 'success'),
+        }
+
+        with lock:
+            countermeasure_log.appendleft(log_entry)
+            attack_stats['countermeasures_triggered'] += 1
+
+        return log_entry
+
+    @staticmethod
+    def _fmt(type_name: str, target: str, result: dict) -> dict:
+        return {
+            'type':   type_name,
+            'target': target,
+            'status': result.get('status', 'error'),
+            'detail': result.get('output', '')[:200],
+            'action': result.get('action', type_name),
+        }
+
+
+counter_engine = CountermeasureEngine()
+
+
+# ─── Alert Classification ──────────────────────────────────────────────────────
+def _classify_alert(line: str, msg: str):
+    """
+    Classifies an alert line as 'rogue_dhcp', 'dhcp_starvation', or None.
+    Checks SID first (most reliable), then falls back to keyword matching.
+
+    SID 1000001 → dhcp_starvation
+    SID 1000002 → rogue_dhcp  (OFFER from non-ESW1)
+    SID 1000003 → rogue_dhcp  (ACK   from non-ESW1)
+    """
+    # SID-based classification (primary)
+    for sid in CONFIG['SID_ROGUE_DHCP']:
+        if f':{sid}:' in line or f'[1:{sid}' in line:
+            return 'rogue_dhcp'
+
+    sid_starv = str(CONFIG['SID_DHCP_STARVATION'])
+    if f':{sid_starv}:' in line or f'[1:{sid_starv}' in line:
+        return 'dhcp_starvation'
+
+    # Keyword fallback
+    for kw in CONFIG['KEYWORDS_ROGUE_DHCP']:
+        if kw.lower() in line.lower() or kw.lower() in msg.lower():
+            return 'rogue_dhcp'
+    for kw in CONFIG['KEYWORDS_STARVATION']:
+        if kw.lower() in line.lower() or kw.lower() in msg.lower():
+            return 'dhcp_starvation'
+
+    return None
+
+
+def parse_fast_alert_line(line: str):
+    """
+    Parses a single line from Snort's alert_fast.txt.
+    Returns a structured alert dict or None if the line is not a DHCP attack.
+    """
+    try:
+        # Quick pre-filter — only process lines containing DHCP-related content
+        dhcp_keywords = (
+            CONFIG['KEYWORDS_STARVATION'] +
+            CONFIG['KEYWORDS_ROGUE_DHCP'] +
+            [str(CONFIG['SID_DHCP_STARVATION'])] +
+            [str(s) for s in CONFIG['SID_ROGUE_DHCP']]
+        )
+        if not any(kw.lower() in line.lower() for kw in dhcp_keywords):
+            return None
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Extract message from [**] ... [**] section
+        msg = "DHCP Attack Detected"
+        if '[**]' in line:
+            parts = line.split('[**]')
+            if len(parts) >= 2:
+                msg_part = parts[1].strip()
+                msg = msg_part.split('[')[0].strip() if '[' in msg_part else msg_part
+
+        attack_type = _classify_alert(line, msg)
+        if attack_type is None:
+            return None
+
+        # Resolve SID for this alert type
+        if attack_type == 'rogue_dhcp':
+            # Determine which rogue SID fired
+            sid = CONFIG['SID_ROGUE_DHCP'][0]
+            for s in CONFIG['SID_ROGUE_DHCP']:
+                if str(s) in line:
+                    sid = s
+                    break
+        else:
+            sid = CONFIG['SID_DHCP_STARVATION']
+
+        src_ip = dst_ip = 'unknown'
+        src_port = dst_port = '0'
+        protocol = 'UDP'
+
+        # Parse src/dst from "A.B.C.D:port -> E.F.G.H:port"
+        if '->' in line:
+            arrow_parts = line.split('->')
+            if len(arrow_parts) == 2:
+                left  = arrow_parts[0].strip().split()
+                right = arrow_parts[1].strip().split()
+
+                src_full = left[-1]  if left  else 'unknown'
+                dst_full = right[0]  if right else 'unknown'
+
+                src_ip   = src_full.split(':')[0] if ':' in src_full else src_full
+                src_port = src_full.split(':')[1] if ':' in src_full else ('67' if attack_type == 'rogue_dhcp' else '68')
+                dst_ip   = dst_full.split(':')[0] if ':' in dst_full else dst_full
+                dst_port = dst_full.split(':')[1] if ':' in dst_full else ('68' if attack_type == 'rogue_dhcp' else '67')
+
+                for part in left:
+                    if part.startswith('{') and part.endswith('}'):
+                        protocol = part[1:-1]
+
+        # Determine which campus subnet was targeted
+        subnet = determine_subnet(dst_ip if attack_type == 'dhcp_starvation' else src_ip)
+
+        display_msg = (
+            "Rogue DHCP Server Detected — Unauthorized DHCP Response" if attack_type == 'rogue_dhcp'
+            else "DHCP Starvation Attack — Pool Exhaustion Attempt"
+        )
+        if msg and msg != "DHCP Attack Detected":
+            display_msg = msg
+
+        return {
+            'timestamp':     timestamp,
+            'sid':           sid,
+            'attack_type':   attack_type,
+            'msg':           display_msg,
+            'src_ip':        src_ip,
+            'dst_ip':        dst_ip,
+            'src_port':      src_port,
+            'dst_port':      dst_port,
+            'protocol':      protocol,
+            'target_subnet': subnet,
+            'src_mac':       lookup_mac(src_ip),
+            'priority':      1 if attack_type == 'rogue_dhcp' else 2,
+            'raw':           line.strip(),
+        }
+
+    except Exception as e:
+        print(f"[parse_fast_alert_line] error: {e}")
+        return None
+
+
+# ─── Network Helpers ───────────────────────────────────────────────────────────
+def determine_subnet(ip: str) -> str:
+    """Returns the HOME_NET subnet string that contains the given IP, or 'unknown'."""
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        for net_str in CONFIG['HOME_NETS']:
+            if ip_obj in ipaddress.ip_network(net_str):
+                return net_str
+    except Exception:
+        pass
+    return 'unknown'
+
+
+def lookup_mac(ip: str) -> str:
+    """Looks up the MAC address for an IP using the ARP neighbour table."""
+    try:
+        result = subprocess.run(
+            f"ip neigh show {ip}",
+            shell=True, capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            parts = result.stdout.strip().split()
+            for i, part in enumerate(parts):
+                if part == 'lladdr' and i + 1 < len(parts):
+                    return parts[i + 1]
+    except Exception:
+        pass
+    return 'unknown'
+
+
+# ─── Stats ─────────────────────────────────────────────────────────────────────
+def update_attack_stats(alert: dict):
+    subnet      = alert.get('target_subnet', 'unknown')
+    src_ip      = alert.get('src_ip',        'unknown')
+    attack_type = alert.get('attack_type',   'dhcp_starvation')
+
+    with lock:
+        attack_stats['total_alerts'] += 1
+
+        if attack_type == 'rogue_dhcp':
+            attack_stats['total_rogue_dhcp'] += 1
+        else:
+            attack_stats['total_starvation'] += 1
+
+        attack_stats['attacks_by_subnet'][subnet] += 1
+        attack_stats['attacks_by_src_ip'][src_ip] += 1
+
+        current_min = datetime.now().strftime("%H:%M")
+        for item in attack_stats['attack_timeline']:
+            if item['time'] == current_min:
+                item['count'] += 1
+                break
+        else:
+            attack_stats['attack_timeline'].append({'time': current_min, 'count': 1})
+
+
+def get_current_stats() -> dict:
+    with lock:
+        return {
+            'total_alerts':              attack_stats['total_alerts'],
+            'total_starvation':          attack_stats['total_starvation'],
+            'total_rogue_dhcp':          attack_stats['total_rogue_dhcp'],
+            'active_attacks':            len(active_countermeasures),
+            'blocked_hosts':             len(attack_stats['blocked_hosts']),
+            'countermeasures_triggered': attack_stats['countermeasures_triggered'],
+            'attacks_by_subnet':         dict(attack_stats['attacks_by_subnet']),
+            'attacks_by_src_ip':         dict(attack_stats['attacks_by_src_ip']),
+            'timeline':                  list(attack_stats['attack_timeline']),
+            'recent_alerts':             list(alert_history)[:10],
+        }
+
+
+# ─── Background Monitor ────────────────────────────────────────────────────────
+def background_alert_monitor():
+    """
+    Tails alert_fast.txt in real-time, parses new lines, and pushes
+    parsed alerts to connected dashboard clients via WebSocket.
+    """
+    print("[*] Starting background alert monitor…")
+    fast_path     = os.path.join(CONFIG['SNORT_LOG_DIR'], CONFIG['ALERT_FAST_FILE'])
+    last_position = 0
+    last_size     = 0
+
+    while True:
+        try:
+            if os.path.exists(fast_path):
+                current_size = os.path.getsize(fast_path)
+                if current_size > last_size:
+                    with open(fast_path, 'r') as f:
+                        f.seek(last_position)
+                        new_lines     = f.readlines()
+                        last_position = f.tell()
+                        last_size     = current_size
+
+                    for line in new_lines:
+                        alert = parse_fast_alert_line(line)
+                        if alert:
+                            with lock:
+                                alert_history.appendleft(alert)
+
+                            update_attack_stats(alert)
+
+                            socketio.emit('new_alert', {
+                                'alert': alert,
+                                'stats': get_current_stats(),
+                            }, namespace='/')
+
+                            if alert['src_ip'] not in active_countermeasures:
+                                active_countermeasures[alert['src_ip']] = True
+
+            time.sleep(2)
+
+        except Exception as e:
+            print(f"[monitor] error: {e}")
+            time.sleep(5)
+
+
+# ─── Routes ────────────────────────────────────────────────────────────────────
+@app.route('/')
+def dashboard():
+    return render_template('dashboard.html')
+
+
+@app.route('/api/stats')
+def api_stats():
+    return jsonify(get_current_stats())
+
+
+@app.route('/api/alerts')
+def api_alerts():
+    attack_type = request.args.get('type')
+    with lock:
+        alerts = list(alert_history)
+    if attack_type:
+        alerts = [a for a in alerts if a.get('attack_type') == attack_type]
+    return jsonify({'alerts': alerts, 'count': len(alerts)})
+
+
+@app.route('/api/reset-dhcp', methods=['POST'])
+def reset_dhcp():
+    """
+    Dashboard 'Reset DHCP Server' button.
+    SSHes into ESW1 and clears all DHCP bindings then restarts the service.
+    Safe to use after both starvation and rogue DHCP attacks.
+    """
+    print("[*] Reset DHCP Server requested via dashboard")
+    result = esw1.reset_dhcp_server()
+
+    log_entry = {
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'action':    'DHCP Server Reset',
+        'status':    result['status'],
+        'detail':    result.get('output', '')[:300],
+    }
+
+    with lock:
+        countermeasure_log.appendleft(log_entry)
+
+    socketio.emit('dhcp_reset_result', {
+        'status':  result['status'],
+        'message': 'DHCP Server reset successfully — IP pool cleared' if result['status'] == 'success'
+                   else f"Reset failed: {result.get('output', 'unknown error')}",
+        'output':  result.get('output', ''),
+    }, namespace='/')
+
+    return jsonify({
+        'status':  result['status'],
+        'message': result.get('action', 'DHCP Reset'),
+        'output':  result.get('output', ''),
+    })
+
+
+@app.route('/api/countermeasures/execute', methods=['POST'])
+def execute_countermeasure():
+    """
+    Handles all countermeasure button clicks from alert cards.
+    Dispatches to the correct ESW1 SSH action based on attack type + measure type.
+    """
+    data         = request.get_json()
+    alert        = data.get('alert', {})
+    measure_type = data.get('type', 'all')
+
+    print(f"[*] Countermeasure: '{measure_type}' for {alert.get('src_ip')} [{alert.get('attack_type')}]")
+
+    result = counter_engine.execute_countermeasure(alert, measure_type)
+
+    socketio.emit('countermeasure_executed', {
+        'result': result,
+        'stats':  get_current_stats(),
+    }, namespace='/')
+
+    return jsonify(result)
+
+
+@app.route('/api/countermeasures/restore', methods=['POST'])
+def restore_port():
+    """Re-enables a shutdown ESW1 port after the threat is resolved."""
+    data   = request.get_json()
+    subnet = data.get('subnet', 'unknown')
+    result = esw1.restore_port(subnet)
+    return jsonify(result)
+
+
+@app.route('/api/countermeasures/log')
+def api_countermeasure_log():
+    with lock:
+        return jsonify({
+            'logs':           list(countermeasure_log),
+            'total_executed': attack_stats['countermeasures_triggered'],
+        })
+
+
+# ─── WebSocket Handlers ────────────────────────────────────────────────────────
+@socketio.on('connect')
+def handle_connect():
+    print(f"[+] Client connected: {request.sid}")
+    emit('initial_data', {
+        'stats':           get_current_stats(),
+        'alerts':          list(alert_history)[:20],
+        'countermeasures': list(countermeasure_log)[:10],
+    })
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f"[-] Client disconnected: {request.sid}")
+
+
+@socketio.on('request_countermeasure')
+def handle_countermeasure_request(data):
+    alert        = data.get('alert', {})
+    measure_type = data.get('type', 'all')
+    result       = counter_engine.execute_countermeasure(alert, measure_type)
+    emit('countermeasure_result', {
+        'success': result['success_count'] > 0,
+        'result':  result,
+        'stats':   get_current_stats(),
+    }, broadcast=True)
+
+
+@socketio.on('reset_server')
+def handle_reset_server(data):
+    print("[*] Reset server via WebSocket")
+    result = esw1.reset_dhcp_server()
+    emit('dhcp_reset_result', {
+        'status':  result['status'],
+        'message': 'DHCP Server reset successfully' if result['status'] == 'success'
+                   else f"Reset failed: {result.get('output', '')}",
+    }, broadcast=True)
+
+
+# ─── Entry Point ───────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    monitor_thread = threading.Thread(target=background_alert_monitor, daemon=True)
+    monitor_thread.start()
+
+    print("[*] Snort DHCP Defense Dashboard starting…")
+    print(f"[*] ESW1 management IP : {CONFIG['ESW1_HOST']}")
+    print(f"[*] Trusted DHCP SVIs  : {', '.join(CONFIG['TRUSTED_DHCP_SERVERS'])}")
+    print(f"[*] Watching SIDs      : starvation={CONFIG['SID_DHCP_STARVATION']}, rogue={CONFIG['SID_ROGUE_DHCP']}")
+    print("[*] Dashboard available at: http://0.0.0.0:5000")
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
